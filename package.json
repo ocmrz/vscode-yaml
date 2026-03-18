@@ -49,7 +49,12 @@
     "onLanguage:github-actions-workflow",
     "onLanguage:home-assistant",
     "onLanguage:manifest-yaml",
-    "onLanguage:spring-boot-properties-yaml"
+    "onLanguage:spring-boot-properties-yaml",
+    "onLanguage:markdown",
+    "onLanguage:mdx",
+    "onLanguage:mdc",
+    "onLanguage:rmd",
+    "onLanguage:quarto"
   ],
   "keywords": [
     "kubernetes",

@@ -21,6 +21,7 @@ import { getConflictingExtensions, showUninstallConflictsNotification } from './
 import { TelemetryErrorHandler, TelemetryOutputChannel } from './telemetry';
 import { createJSONSchemaStatusBarItem } from './schema-status-bar-item';
 import { initializeRecommendation } from './recommendation';
+import { blankMarkdownBody, isFrontMatterLanguage, FRONTMATTER_LANGUAGE_IDS, FrontMatterTracker } from './markdown-frontmatter';
 
 export interface ISchemaAssociations {
   [pattern: string]: string[];
@@ -115,6 +116,7 @@ export function startClient(
   const telemetryErrorHandler = new TelemetryErrorHandler(runtime.telemetry, lsName, 4);
   const outputChannel = window.createOutputChannel(lsName);
   const l10nPath = context.asAbsolutePath('./dist/l10n');
+
   // Options to control the language client
   const clientOptions: LanguageClientOptions = {
     // Register the server for on disk and newly created YAML documents
@@ -129,6 +131,7 @@ export function startClient(
       { language: 'home-assistant' },
       { language: 'manifest-yaml' },
       { language: 'spring-boot-properties-yaml' },
+      ...FRONTMATTER_LANGUAGE_IDS.map((lang) => ({ language: lang })),
     ],
     synchronize: {
       // Notify the server about file changes to YAML and JSON files contained in the workspace
@@ -140,6 +143,7 @@ export function startClient(
     initializationOptions: {
       l10nPath,
     },
+    middleware: createFrontMatterMiddleware(() => client),
   };
 
   // Create the language client and start it
@@ -313,4 +317,115 @@ async function sendStartupTelemetryEvent(telemetry: TelemetryService, initialize
 
 export function logToExtensionOutputChannel(message: string): void {
   client.outputChannel.appendLine(message);
+}
+
+/**
+ * Creates middleware that intercepts document sync and language features for
+ * Markdown-family files with YAML front matter. The middleware blanks out the
+ * body (replacing it with empty lines) so the YAML language server only sees
+ * the front matter while all line positions remain identical to the original
+ * file -- zero position mapping required.
+ */
+function createFrontMatterMiddleware(getClient: () => CommonLanguageClient): LanguageClientOptions['middleware'] {
+  const tracker = new FrontMatterTracker();
+  return {
+    didOpen(document, next) {
+      if (!isFrontMatterLanguage(document.languageId)) return next(document);
+
+      const result = blankMarkdownBody(document.getText());
+      if (!result) return; // no front matter -- don't sync to server
+
+      tracker.set(document.uri.toString(), result.endLine);
+      getClient().sendNotification('textDocument/didOpen', {
+        textDocument: {
+          uri: document.uri.toString(),
+          languageId: 'yaml',
+          version: document.version,
+          text: result.text,
+        },
+      });
+    },
+
+    didChange(event, next) {
+      if (!isFrontMatterLanguage(event.document.languageId)) return next(event);
+
+      const uri = event.document.uri.toString();
+      const result = blankMarkdownBody(event.document.getText());
+
+      if (!result) {
+        // Front matter disappeared -- close the document on the server
+        if (tracker.has(uri)) {
+          tracker.delete(uri);
+          getClient().sendNotification('textDocument/didClose', {
+            textDocument: { uri },
+          });
+        }
+        return;
+      }
+
+      if (!tracker.has(uri)) {
+        // Front matter appeared -- open the document on the server
+        tracker.set(uri, result.endLine);
+        getClient().sendNotification('textDocument/didOpen', {
+          textDocument: {
+            uri,
+            languageId: 'yaml',
+            version: event.document.version,
+            text: result.text,
+          },
+        });
+        return;
+      }
+
+      tracker.set(uri, result.endLine);
+      getClient().sendNotification('textDocument/didChange', {
+        textDocument: { uri, version: event.document.version },
+        contentChanges: [{ text: result.text }],
+      });
+    },
+
+    didClose(document, next) {
+      if (!isFrontMatterLanguage(document.languageId)) return next(document);
+
+      const uri = document.uri.toString();
+      if (tracker.has(uri)) {
+        tracker.delete(uri);
+        getClient().sendNotification('textDocument/didClose', {
+          textDocument: { uri },
+        });
+      }
+    },
+
+    handleDiagnostics(uri, diagnostics, next) {
+      const info = tracker.get(uri.toString());
+      if (!info) return next(uri, diagnostics);
+
+      const filtered = diagnostics.filter((d) => d.range.start.line <= info.endLine);
+      next(uri, filtered);
+    },
+
+    provideHover(document, position, token, next) {
+      if (!isFrontMatterLanguage(document.languageId)) return next(document, position, token);
+      const info = tracker.get(document.uri.toString());
+      if (!info || position.line > info.endLine) return null;
+      return next(document, position, token);
+    },
+
+    provideCompletionItem(document, position, context, token, next) {
+      if (!isFrontMatterLanguage(document.languageId)) return next(document, position, context, token);
+      const info = tracker.get(document.uri.toString());
+      if (!info || position.line > info.endLine) return null;
+      return next(document, position, context, token);
+    },
+
+    provideDocumentFormattingEdits(document, _options, _token, next) {
+      if (isFrontMatterLanguage(document.languageId)) return [];
+      return next(document, _options, _token);
+    },
+
+    provideDocumentRangeFormattingEdits(document, range, _options, _token, next) {
+      if (isFrontMatterLanguage(document.languageId)) return [];
+      return next(document, range, _options, _token);
+    },
+  };
 }

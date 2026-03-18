@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "required": ["title"],
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "The page title"
+    },
+    "date": {
+      "type": "string",
+      "format": "date",
+      "description": "Publication date"
+    },
+    "draft": {
+      "type": "boolean",
+      "description": "Whether the page is a draft"
+    }
+  },
+  "additionalProperties": false
+}
