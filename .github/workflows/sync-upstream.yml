@@ -1,0 +1,84 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: fork
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream https://github.com/redhat-developer/vscode-yaml.git
+          git fetch upstream main
+          git fetch origin main
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          LOCAL=$(git rev-parse origin/main)
+          UPSTREAM=$(git rev-parse upstream/main)
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fast-forward main
+        if: steps.check.outputs.up_to_date == 'false'
+        run: |
+          git checkout main
+          git merge --ff-only upstream/main
+          git push origin main
+
+      - name: Rebase fork onto main
+        if: steps.check.outputs.up_to_date == 'false'
+        id: rebase
+        run: |
+          git checkout fork
+          if git rebase main; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            git rebase --abort
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased fork
+        if: steps.check.outputs.up_to_date == 'false' && steps.rebase.outputs.conflict == 'false'
+        run: git push --force-with-lease origin fork
+
+      - name: Open issue on conflict
+        if: steps.rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          gh issue create \
+            --title "Upstream sync conflict: manual rebase needed" \
+            --body "Automatic rebase of \`fork\` onto \`main\` failed after syncing upstream to ${UPSTREAM_SHA:0:7}.
+
+          Run locally:
+          \`\`\`bash
+          git fetch origin
+          git checkout fork
+          git rebase origin/main
+          # resolve conflicts
+          git push --force-with-lease origin fork
+          \`\`\`"
