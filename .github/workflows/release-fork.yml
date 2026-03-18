@@ -1,0 +1,109 @@
+name: Release fork
+
+on:
+  schedule:
+    - cron: '30 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: 'Force build for this upstream version (e.g. 1.22.0)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_version: ${{ steps.detect.outputs.upstream_version }}
+      should_release: ${{ steps.detect.outputs.should_release }}
+    steps:
+      - name: Detect upstream release
+        id: detect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.force_version }}" ]; then
+            UPSTREAM_VERSION="${{ inputs.force_version }}"
+          else
+            UPSTREAM_VERSION=$(gh api repos/redhat-developer/vscode-yaml/releases/latest --jq '.tag_name')
+          fi
+          echo "upstream_version=${UPSTREAM_VERSION}" >> "$GITHUB_OUTPUT"
+
+          FORK_TAG="fork/${UPSTREAM_VERSION}"
+          if gh release view "${FORK_TAG}" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build-and-release:
+    runs-on: ubuntu-latest
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    env:
+      EXT_VERSION: ${{ needs.check.outputs.upstream_version }}
+    steps:
+      - name: Checkout fork branch
+        uses: actions/checkout@v4
+        with:
+          ref: fork
+          fetch-depth: 0
+
+      - name: Verify fork includes upstream release
+        if: ${{ !inputs.force_version }}
+        run: |
+          git fetch https://github.com/redhat-developer/vscode-yaml.git tag "$EXT_VERSION" --no-tags
+          TAG_SHA=$(git rev-parse FETCH_HEAD)
+          if ! git merge-base --is-ancestor "$TAG_SHA" HEAD; then
+            echo "::error::Upstream tag ${EXT_VERSION} (${TAG_SHA:0:7}) is not an ancestor of fork HEAD. Skipping release."
+            exit 1
+          fi
+          echo "Verified: upstream ${EXT_VERSION} (${TAG_SHA:0:7}) is included in fork HEAD."
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set version in package.json
+        run: |
+          jq --arg v "$EXT_VERSION" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+
+      - name: Install dependencies
+        run: |
+          npm install -g typescript "@vscode/vsce"
+          npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        uses: coactions/setup-xvfb@b6b4fcfb9f5a895edadc3bc76318fae0ac17c8b3 #v1.0.1
+        with:
+          run: npm test --silent
+
+      - name: Package
+        run: |
+          vsce package -o vscode-yaml-${EXT_VERSION}.vsix
+          sha256sum *.vsix > vscode-yaml-${EXT_VERSION}.vsix.sha256
+          ls -lash *.vsix *.sha256
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "fork/${EXT_VERSION}" \
+            --title "fork/${EXT_VERSION}" \
+            --target fork \
+            --notes "Built from \`fork\` branch at $(git rev-parse --short HEAD).
+
+          **Base**: upstream [${EXT_VERSION}](https://github.com/redhat-developer/vscode-yaml/releases/tag/${EXT_VERSION})
+
+          **Patches included:**
+          - YAML front matter support for markdown-family files (markdown, mdx, mdc, rmd, quarto)" \
+            vscode-yaml-${EXT_VERSION}.vsix \
+            vscode-yaml-${EXT_VERSION}.vsix.sha256
